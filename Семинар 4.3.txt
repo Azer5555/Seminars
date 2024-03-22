@@ -1,0 +1,337 @@
+Генерация текста с помощью RNN
+
+(по мотивам семинара курса "Deep Learning in Applications")
+
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle,
+# выполните следующие строчки, чтобы подгрузить библиотеку dlnlputils:
+
+# !git clone https://github.com/Samsung-IT-Academy/stepik-dl-nlp.git && pip install -r stepik-dl-nlp/requirements.txt
+# import sys; sys.path.append('./stepik-dl-nlp')
+In [ ]:
+
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
+%matplotlib inline
+Данные
+
+Датасет содержит ~9k имен, все написаны латиницей.
+
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle, добавьте в начало пути ./stepik-dl-nlp
+with open('datasets/russian_names.txt') as input_file:
+    names = input_file.read()[:-1].split('\n')
+    names = [' ' + line for line in names]
+In [ ]:
+
+names[:5]
+Посмотрим на распределение длин имен:
+
+In [ ]:
+
+plt.title('Name length distribution')
+plt.hist(list(map(len, names)), bins=25);
+Препроцессинг
+
+In [ ]:
+
+#all unique characters go here
+tokens = list(set(''.join(names)))
+
+num_tokens = len(tokens)
+print ('num_tokens = ', num_tokens)
+Символы -> id
+
+Создадим словарь < символ > -> < id >
+
+In [ ]:
+
+token_to_id = {token: idx for idx, token in enumerate(tokens)}
+In [ ]:
+
+assert len(tokens) == len(token_to_id), "dictionaries must have same size"
+
+for i in range(num_tokens):
+    assert token_to_id[tokens[i]] == i, "token identifier must be it's position in tokens list"
+
+print("Seems alright!")
+In [ ]:
+
+def to_matrix(data, token_to_id, max_len=None, dtype='int32', batch_first = True):
+    """Casts a list of names into rnn-digestable matrix"""
+    
+    max_len = max_len or max(map(len, data))
+    data_ix = np.zeros([len(data), max_len], dtype) + token_to_id[' ']
+
+    for i in range(len(data)):
+        line_ix = [token_to_id[c] for c in data[i]]
+        data_ix[i, :len(line_ix)] = line_ix
+        
+    if not batch_first: # convert [batch, time] into [time, batch]
+        data_ix = np.transpose(data_ix)
+
+    return data_ix
+In [ ]:
+
+#Example: cast 4 names to matrices, pad with zeros
+print('\n'.join(names[::2000]))
+print(to_matrix(names[::2000], token_to_id))
+Рекуррентные нейронные сети
+
+
+
+In [ ]:
+
+import torch, torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+In [ ]:
+
+class CharRNNCell(nn.Module):
+    """
+    Implement the scheme above as torch module
+    """
+    def __init__(self, num_tokens=len(tokens), embedding_size=16, rnn_num_units=64):
+        super(self.__class__,self).__init__()
+        self.num_units = rnn_num_units
+        
+        self.embedding = nn.Embedding(num_tokens, embedding_size)
+        self.rnn_update = nn.Linear(embedding_size + rnn_num_units, rnn_num_units)
+        self.rnn_to_logits = nn.Linear(rnn_num_units, num_tokens)
+        
+    def forward(self, x, h_prev):
+        """
+        This method computes h_next(x, h_prev) and log P(x_next | h_next)
+        We'll call it repeatedly to produce the whole sequence.
+        
+        :param x: batch of character ids, variable containing vector of int64
+        :param h_prev: previous rnn hidden states, variable containing matrix [batch, rnn_num_units] of float32
+        """
+        # get vector embedding of x
+        x_emb = self.embedding(x)
+        
+        # compute next hidden state using self.rnn_update
+        x_and_h = torch.cat([x_emb, h_prev], dim=1) #YOUR CODE HERE
+        h_next = self.rnn_update(x_and_h) #YOUR CODE HERE
+        
+        h_next = F.tanh(h_next)
+        
+        assert h_next.size() == h_prev.size()
+        
+        #compute logits for next character probs
+        logits = self.rnn_to_logits(h_next)
+        
+        return h_next, F.log_softmax(logits, -1)
+    
+    def initial_state(self, batch_size):
+        """ return rnn state before it processes first input (aka h0) """
+        return Variable(torch.zeros(batch_size, self.num_units))
+In [ ]:
+
+char_rnn = CharRNNCell()
+Тренировка сети, RNN loop
+
+In [ ]:
+
+def rnn_loop(rnn, batch_index):
+    """
+    Computes log P(next_character) for all time-steps in names_ix
+    :param names_ix: an int32 matrix of shape [batch, time], output of to_matrix(names)
+    """
+    batch_size, max_length = batch_index.size()
+    hid_state = rnn.initial_state(batch_size)
+    logprobs = []
+
+    for x_t in batch_index.transpose(0,1):
+        hid_state, logp_next = rnn(x_t, hid_state)  
+        logprobs.append(logp_next)
+        
+    return torch.stack(logprobs, dim=1)
+Тренировка сети
+
+In [ ]:
+
+from IPython.display import clear_output
+from random import sample
+
+char_rnn = CharRNNCell()
+opt = torch.optim.Adam(char_rnn.parameters())
+history = []
+In [ ]:
+
+MAX_LENGTH = max(map(len, names))
+
+for i in range(1000):
+    batch_ix = to_matrix(sample(names, 32), token_to_id, max_len=MAX_LENGTH)
+    batch_ix = torch.tensor(batch_ix, dtype=torch.int64)
+    
+    logp_seq = rnn_loop(char_rnn, batch_ix)
+    
+    # compute loss
+    predictions_logp = logp_seq[:, :-1]
+    actual_next_tokens = batch_ix[:, 1:]
+
+    loss = -torch.mean(torch.gather(predictions_logp, dim=2, index=actual_next_tokens[:,:,None]))###YOUR CODE
+    
+    # train with backprop
+    loss.backward()
+    opt.step()
+    opt.zero_grad()
+    
+    # visualizing training process
+    history.append(loss.data.numpy())
+    if (i + 1) % 100 == 0:
+        clear_output(True)
+        plt.plot(history,label='loss')
+        plt.legend()
+        plt.show()
+
+assert np.mean(history[:10]) > np.mean(history[-10:]), "RNN didn't converge."
+RNN: генерация имен
+
+In [ ]:
+
+def generate_sample(char_rnn, seed_phrase=' ', max_length=MAX_LENGTH, temperature=1.0):
+    '''
+    The function generates text given a phrase of length at least SEQ_LENGTH.
+    :param seed_phrase: prefix characters. The RNN is asked to continue the phrase
+    :param max_length: maximum output length, including seed_phrase
+    :param temperature: coefficient for sampling.  higher temperature produces more chaotic outputs,
+                        smaller temperature converges to the single most likely output
+    '''
+    
+    x_sequence = [token_to_id[token] for token in seed_phrase]
+    x_sequence = torch.tensor([x_sequence], dtype=torch.int64)
+    hid_state = char_rnn.initial_state(batch_size=1)
+    
+    #feed the seed phrase, if any
+    for i in range(len(seed_phrase) - 1):
+        hid_state, _ = char_rnn(x_sequence[:, i], hid_state)
+    
+    #start generating
+    for _ in range(max_length - len(seed_phrase)):
+        hid_state, logp_next = char_rnn(x_sequence[:, -1], hid_state)
+        p_next = F.softmax(logp_next / temperature, dim=-1).data.numpy()[0]
+        
+        # sample next token and push it back into x_sequence
+        next_ix = np.random.choice(len(tokens), p=p_next)
+        next_ix = torch.tensor([[next_ix]], dtype=torch.int64)
+        x_sequence = torch.cat([x_sequence, next_ix], dim=1)
+        
+    return ''.join([tokens[ix] for ix in x_sequence.data.numpy()[0]])
+In [ ]:
+
+for _ in range(10):
+    print(generate_sample(char_rnn))
+In [ ]:
+
+for _ in range(10):
+    print(generate_sample(char_rnn, seed_phrase=' Ar'))
+Более простое решение
+
+nn.RNNCell(emb_size, rnn_num_units) - шаг RNN. Алгоритм: concat-linear-tanh
+nn.RNN(emb_size, rnn_num_units - весь rnn_loop.
+Кроме того, в PyTorch есть nn.LSTMCell, nn.LSTM, nn.GRUCell, nn.GRU, etc. etc.
+
+Перепишем наш пример с генерацией имен с помощью средств PyTorch.
+
+In [ ]:
+
+class CharRNNLoop(nn.Module):
+    def __init__(self, num_tokens=num_tokens, emb_size=16, rnn_num_units=64):
+        super(self.__class__, self).__init__()
+        self.emb = nn.Embedding(num_tokens, emb_size)
+        self.rnn = nn.RNN(emb_size, rnn_num_units, batch_first=True)
+        self.hid_to_logits = nn.Linear(rnn_num_units, num_tokens)
+        
+    def forward(self, x):
+        assert isinstance(x, Variable) and isinstance(x.data, torch.LongTensor)
+        h_seq, _ = self.rnn(self.emb(x))
+        next_logits = self.hid_to_logits(h_seq)
+        next_logp = F.log_softmax(next_logits, dim=-1)
+        return next_logp
+    
+model = CharRNNLoop()
+opt = torch.optim.Adam(model.parameters())
+history = []
+In [ ]:
+
+# the model applies over the whole sequence
+batch_ix = to_matrix(sample(names, 32), token_to_id, max_len=MAX_LENGTH)
+batch_ix = Variable(torch.LongTensor(batch_ix))
+
+logp_seq = model(batch_ix)
+
+# compute loss
+loss = F.nll_loss(logp_seq[:, 1:].contiguous().view(-1, num_tokens), 
+                  batch_ix[:, :-1].contiguous().view(-1))
+
+loss.backward()
+In [ ]:
+
+MAX_LENGTH = max(map(len, names))
+
+for i in range(1000):
+    batch_ix = to_matrix(sample(names, 32), token_to_id, max_len=MAX_LENGTH)
+    batch_ix = torch.tensor(batch_ix, dtype=torch.int64)
+    
+    logp_seq = model(batch_ix)
+    
+    # compute loss
+    predictions_logp = logp_seq[:, :-1]
+    actual_next_tokens = batch_ix[:, 1:]
+
+    loss = -torch.mean(torch.gather(predictions_logp, dim=2, index=actual_next_tokens[:,:,None]))
+    
+    # train with backprop
+    loss.backward()
+    opt.step()
+    opt.zero_grad()
+    
+    history.append(loss.data.numpy())
+    if (i + 1) % 100 == 0:
+        clear_output(True)
+        plt.plot(history, label='loss')
+        plt.legend()
+        plt.show()
+
+assert np.mean(history[:25]) > np.mean(history[-25:]), "RNN didn't converge."
+In [ ]:
+
+for _ in range(10):
+    print(generate_sample(char_rnn))
+Домашнее задание: мотивационные лозунги
+
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle, добавьте в начало пути ./stepik-dl-nlp
+with open('datasets/author_quotes.txt') as input_file:
+    quotes = input_file.read()[:-1].split('\n')
+    quotes = [' ' + line for line in quotes]
+In [ ]:
+
+quotes[:5]
+In [ ]:
+
+tokens = list(set(''.join(quotes)))
+token_to_id = {token: idx for idx, token in enumerate(tokens)}
+num_tokens = len(tokens)
+In [ ]:
+
+# your code here
+Что еще можно генерировать?
+
+С помощью кода из этого семинара можно генерировать не только имена, но и:
+
+Повести/романы/поэзию/песни любимого автора
+Новостные заголовки
+Программный код
+Молекулы в формате smiles
+Музыку
+Названия мебели из ИКЕА
+Мотивационные лозунги
+etc.

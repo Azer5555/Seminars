@@ -1,0 +1,279 @@
+Word2Vec
+
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle,
+# выполните следующие строчки, чтобы подгрузить библиотеку dlnlputils:
+
+# !git clone https://github.com/Samsung-IT-Academy/stepik-dl-nlp.git && pip install -r stepik-dl-nlp/requirements.txt
+# import sys; sys.path.append('./stepik-dl-nlp')
+In [ ]:
+
+%load_ext autoreload
+%autoreload 2
+
+import random
+import pandas as pd
+import numpy as np
+
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+import dlnlputils
+from dlnlputils.data import tokenize_corpus, build_vocabulary, texts_to_token_ids, \
+    PaddedSequenceDataset, Embeddings
+from dlnlputils.pipeline import train_eval_loop, predict_with_model, init_random_seed
+from dlnlputils.visualization import plot_vectors
+
+init_random_seed()
+Загрузка данных и подготовка корпуса
+
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle, добавьте в начало пути ./stepik-dl-nlp
+full_dataset = list(pd.read_csv('./datasets/nyt-ingredients-snapshot-2015.csv')['input'].dropna())
+random.shuffle(full_dataset)
+
+TRAIN_VAL_SPLIT = int(len(full_dataset) * 0.7)
+train_source = full_dataset[:TRAIN_VAL_SPLIT]
+test_source = full_dataset[TRAIN_VAL_SPLIT:]
+print("Обучающая выборка", len(train_source))
+print("Тестовая выборка", len(test_source))
+print()
+print('\n'.join(train_source[:10]))
+In [ ]:
+
+# токенизируем
+train_tokenized = tokenize_corpus(train_source)
+test_tokenized = tokenize_corpus(test_source)
+print('\n'.join(' '.join(sent) for sent in train_tokenized[:10]))
+In [ ]:
+
+# строим словарь
+vocabulary, word_doc_freq = build_vocabulary(train_tokenized, max_doc_freq=0.9, min_count=5, pad_word='<PAD>')
+print("Размер словаря", len(vocabulary))
+print(list(vocabulary.items())[:10])
+In [ ]:
+
+# отображаем в номера токенов
+train_token_ids = texts_to_token_ids(train_tokenized, vocabulary)
+test_token_ids = texts_to_token_ids(test_tokenized, vocabulary)
+
+print('\n'.join(' '.join(str(t) for t in sent)
+                for sent in train_token_ids[:10]))
+In [ ]:
+
+plt.hist([len(s) for s in train_token_ids], bins=20);
+plt.title('Гистограмма длин предложений');
+In [ ]:
+
+MAX_SENTENCE_LEN = 20
+train_dataset = PaddedSequenceDataset(train_token_ids,
+                                      np.zeros(len(train_token_ids)),
+                                      out_len=MAX_SENTENCE_LEN)
+test_dataset = PaddedSequenceDataset(test_token_ids,
+                                     np.zeros(len(test_token_ids)),
+                                     out_len=MAX_SENTENCE_LEN)
+print(train_dataset[0])
+Алгоритм обучения - Skip Gram Negative Sampling
+
+Skip Gram - предсказываем соседние слова по центральному слову
+
+Negative Sampling - аппроксимация softmax
+
+�,�∈������×�������
+
+∑���������(����−2,����−1,����+1,����+2|��������;�,�)→max�,�
+
+�(����−2,����−1,����+1,����+2|��������;�,�)=∏��(�����|��������;�,�)
+
+�(�����|��������;�,�)=���⋅��∑�=1|�|���⋅��=�������≃���⋅��+∑�=1����⋅��−,�≪|�|
+
+In [ ]:
+
+def make_diag_mask(size, radius):
+    """Квадратная матрица размера Size x Size с двумя полосами ширины radius вдоль главной диагонали"""
+    idxs = torch.arange(size)
+    abs_idx_diff = (idxs.unsqueeze(0) - idxs.unsqueeze(1)).abs()
+    mask = ((abs_idx_diff <= radius) & (abs_idx_diff > 0)).float()
+    return mask
+
+make_diag_mask(10, 3)
+Negative Sampling работает следующим образом - мы максимизируем сумму вероятностей двух событий:
+
+"этот пример центрального слова вместе с контекстными словами взят из тренировочной выборки":�(�=1|��������;�����)=�������(��⋅��)=11+�−��⋅��
+ 
+
+"этот пример центрального слова вместе со случайми контекстными словами выдуман ":�(�=0|��������;���������)=1−�(�=1|��������;���������)=11+���⋅������
+ 
+
+���(�����,��������)=���(11+�−��⋅��)+∑�=1����(11+���⋅�������)→max�,�
+
+In [ ]:
+
+class SkipGramNegativeSamplingTrainer(nn.Module):
+    def __init__(self, vocab_size, emb_size, sentence_len, radius=5, negative_samples_n=5):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.negative_samples_n = negative_samples_n
+
+        self.center_emb = nn.Embedding(self.vocab_size, emb_size, padding_idx=0)
+        self.center_emb.weight.data.uniform_(-1.0 / emb_size, 1.0 / emb_size)
+        self.center_emb.weight.data[0] = 0
+
+        self.context_emb = nn.Embedding(self.vocab_size, emb_size, padding_idx=0)        
+        self.context_emb.weight.data.uniform_(-1.0 / emb_size, 1.0 / emb_size)
+        self.context_emb.weight.data[0] = 0
+
+        self.positive_sim_mask = make_diag_mask(sentence_len, radius)
+    
+    def forward(self, sentences):
+        """sentences - Batch x MaxSentLength - идентификаторы токенов"""
+        batch_size = sentences.shape[0]
+        center_embeddings = self.center_emb(sentences)  # Batch x MaxSentLength x EmbSize
+
+        # оценить сходство с настоящими соседними словами
+        positive_context_embs = self.context_emb(sentences).permute(0, 2, 1)  # Batch x EmbSize x MaxSentLength
+        positive_sims = torch.bmm(center_embeddings, positive_context_embs)  # Batch x MaxSentLength x MaxSentLength
+        positive_probs = torch.sigmoid(positive_sims)
+
+        # увеличить оценку вероятности встретить эти пары слов вместе
+        positive_mask = self.positive_sim_mask.to(positive_sims.device)
+        positive_loss = F.binary_cross_entropy(positive_probs * positive_mask,
+                                               positive_mask.expand_as(positive_probs))
+
+        # выбрать случайные "отрицательные" слова
+        negative_words = torch.randint(1, self.vocab_size,
+                                       size=(batch_size, self.negative_samples_n),
+                                       device=sentences.device)  # Batch x NegSamplesN
+        negative_context_embs = self.context_emb(negative_words).permute(0, 2, 1)  # Batch x EmbSize x NegSamplesN
+        negative_sims = torch.bmm(center_embeddings, negative_context_embs)  # Batch x MaxSentLength x NegSamplesN
+        
+        # уменьшить оценку вероятность встретить эти пары слов вместе
+        negative_loss = F.binary_cross_entropy_with_logits(negative_sims,
+                                                           negative_sims.new_zeros(negative_sims.shape))
+
+        return positive_loss + negative_loss
+
+
+def no_loss(pred, target):
+    """Фиктивная функция потерь - когда модель сама считает функцию потерь"""
+    return pred
+Обучение
+
+In [ ]:
+
+trainer = SkipGramNegativeSamplingTrainer(len(vocabulary), 100, MAX_SENTENCE_LEN,
+                                          radius=5, negative_samples_n=25)
+In [ ]:
+
+best_val_loss, best_model = train_eval_loop(trainer,
+                                            train_dataset,
+                                            test_dataset,
+                                            no_loss,
+                                            lr=1e-2,
+                                            epoch_n=2,
+                                            batch_size=8,
+                                            device='cpu',
+                                            early_stopping_patience=10,
+                                            max_batches_per_epoch_train=2000,
+                                            max_batches_per_epoch_val=len(test_dataset),
+                                            lr_scheduler_ctor=lambda optim: torch.optim.lr_scheduler.ReduceLROnPlateau(optim, patience=1, verbose=True))
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle, добавьте в начало пути ./stepik-dl-nlp
+torch.save(trainer.state_dict(), 'models/sgns.pth')
+In [ ]:
+
+# Если Вы запускаете ноутбук на colab или kaggle, добавьте в начало пути ./stepik-dl-nlp
+trainer.load_state_dict(torch.load('models/sgns.pth'))
+Исследуем характеристики полученных векторов
+
+In [ ]:
+
+embeddings = Embeddings(trainer.center_emb.weight.detach().cpu().numpy(), vocabulary)
+In [ ]:
+
+embeddings.most_similar('chicken')
+In [ ]:
+
+embeddings.analogy('cake', 'cacao', 'cheese')
+In [ ]:
+
+test_words = ['salad', 'fish', 'salmon', 'sauvignon', 'beef', 'pork', 'steak', 'beer', 'cake', 'coffee', 'sausage', 'wine', 'merlot', 'zinfandel', 'trout', 'chardonnay', 'champagne', 'cacao']
+test_vectors = embeddings.get_vectors(*test_words)
+print(test_vectors.shape)
+In [ ]:
+
+fig, ax = plt.subplots()
+fig.set_size_inches((10, 10))
+plot_vectors(test_vectors, test_words, how='svd', ax=ax)
+Обучение Word2Vec с помощью Gensim
+
+In [ ]:
+
+import gensim
+In [ ]:
+
+word2vec = gensim.models.Word2Vec(sentences=train_tokenized, size=100,
+                                  window=5, min_count=5, workers=4,
+                                  sg=1, iter=10)
+In [ ]:
+
+word2vec.wv.most_similar('chicken')
+In [ ]:
+
+gensim_words = [w for w in test_words if w in word2vec.wv.vocab]
+gensim_vectors = np.stack([word2vec.wv[w] for w in gensim_words])
+In [ ]:
+
+fig, ax = plt.subplots()
+fig.set_size_inches((10, 10))
+plot_vectors(gensim_vectors, test_words, how='svd', ax=ax)
+Загрузка предобученного Word2Vec
+
+Источники готовых векторов:
+
+https://rusvectores.org/ru/ - для русского языка
+
+https://wikipedia2vec.github.io/wikipedia2vec/pretrained/ - много разных языков
+
+In [ ]:
+
+import gensim.downloader as api
+In [ ]:
+
+available_models = api.info()['models'].keys()
+print('\n'.join(available_models))
+In [ ]:
+
+pretrained = api.load('word2vec-google-news-300')  # > 1.5 GB!
+In [ ]:
+
+pretrained.most_similar('cheese')
+In [ ]:
+
+pretrained.most_similar(positive=['man', 'queen'], negative=['king'])
+In [ ]:
+
+pretrained_words = [w for w in test_words if w in pretrained.vocab]
+pretrained_vectors = np.stack([pretrained[w] for w in pretrained_words])
+In [ ]:
+
+fig, ax = plt.subplots()
+fig.set_size_inches((10, 10))
+plot_vectors(pretrained_vectors, test_words, how='svd', ax=ax)
+Заключение
+
+Реализовали Skip Gram Negative Sampling на PyTorch
+Обучили на корпусе рецептов
+Сходство слов модель выучила неплохо
+Для аналогий мало данных
+Обучили SGNS с помощью библиотеки Gensim
+Загрузили веса Word2Vec, полученные с помощью большого корпуса (GoogleNews)
+Списки похожих слов отличаются!
+Аналогии работают
